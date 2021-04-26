@@ -1,121 +1,125 @@
 package gen
 
 import (
-	"fmt"
-	"go/ast"
-	"reflect"
-	"strings"
+	"bytes"
 	"text/template"
 
-	"github.com/nikgalushko/molekula/internal/parser"
+	"github.com/nikgalushko/molekula/internal/query"
 )
 
-// StructName, StructName, Code
-const tmpl = `
-	func %sUnmarshal(binMap map[interface{}]interface{}) (ret %s, err error) {
-		%s
-		return
-	}
-`
-
-const simpleSnippet = `
-		{{.Name}}_raw, ok := binMap["{{.Name}}"]
-		if !ok {
-			return {{.Struct}}{}, fmt.Errorf("field {{.Name}} doesnt exist")
-		}
-
-		{{.Name}}_value, ok := {{.Name}}_raw.({{.Type}})
-		if !ok {
-			return {{.Struct}}{}, fmt.Errorf("{{.Name}} is not a {{.Type}} is %T", {{.Name}}_raw)
-		}
-
-		ret.{{.Field}} = {{.Name}}_value
-`
-
-const interfaceSnippet = `
-		{{.Name}}_raw, ok := binMap["{{.Name}}"]
-		if !ok {
-			return {{.Struct}}{}, fmt.Errorf("field {{.Name}} doesnt exist")
-		}
-
-		ret.{{.Field}} = {{.Name}}_raw 
-`
-
-const simpleArraySnippet = `
-		{{.Name}}_raw, ok := binMap["{{.Name}}"]
-		if !ok {
-			return {{.Struct}}{}, fmt.Errorf("field {{.Name}} doesnt exist")
-		}
-
-		{{.Name}}_arr, ok := {{.Name}}_raw.([]{{.Type}})
-		if !ok {
-			return {{.Struct}}{}, fmt.Errorf("{{.Name}} is not a []{{.Type}} is %T", {{.Name}}_raw)
-		}
-
-		ret.{{.Field}} = make([]{{.Type}}, len({{.Name}}_arr))
-		for i, elm := range {{.Name}}_arr {
-			ret.{{.Field}}[i] = elm
-		}
-`
-
-func Generate(structName string, fields []parser.Field) (string, error) {
-	type Inject struct {
-		Name   string
-		Struct string
-		Type   string
-		Field  string
-	}
-	var code strings.Builder
-
-	for _, f := range fields {
-		goType, typeName := typeOf(f.Type)
-
-		var t *template.Template
-
-		switch goType {
-		case "simple":
-			t = template.Must(template.New("simple-snippet").Parse(simpleSnippet))
-		case "interface":
-			t = template.Must(template.New("interface-snippet").Parse(interfaceSnippet))
-		case "array":
-			t = template.Must(template.New("simple-array-snippet").Parse(simpleArraySnippet))
-		}
-
-		if t == nil {
-			continue
-		}
-
-		err := t.Execute(&code, Inject{
-			Name:   f.Alias,
-			Field:  f.Name,
-			Type:   typeName,
-			Struct: structName,
-		})
-		if err != nil {
-			return "", err
-		}
-	}
-
-	return fmt.Sprintf(tmpl, structName, structName, code.String()), nil
+var funcMap = template.FuncMap{
+	"sub": func(i int) int {
+		return i - 1
+	},
+	"inc": func(i int) int {
+		return i + 1
+	},
 }
 
-func typeOf(t ast.Expr) (string, string) {
-	fmt.Println("Type:", t, reflect.TypeOf(t))
+const _map = `
+value_{{.Index}}, ok := {{if .IsTop}}data{{else}}raw_value_{{sub .Index}}{{end}}.(map[interface{}]interface{})
+if !ok {
+	return fmt.Errorf("...")
+}
 
-	simple, ok := t.(*ast.Ident)
-	if ok {
-		return "simple", simple.Name
+ret_{{.Index}} := make({{.Type}})
+for raw_key_{{.Index}}, raw_value_{{.Index}} := range value_{{.Index}} {
+	key_{{.Index}}, ok := raw_key_{{.Index}}.({{.KeyType}})
+	if !ok {
+		return fmt.Errorf("key is not a string")
+	}
+	{{if .Next.IsBuiltin}}
+		value_{{.Index}}, ok := raw_value_{{.Index}}.({{.Next.Type}})
+		if !ok {
+			return fmt.Errorf("...")
+		}
+
+		ret_{{.Index}}[key_{{.Index}}] = value_{{.Index}}
+	{{else}}
+		{{with .Next}}{{template "T" .}}{{end}}
+		ret_{{.Index}}[key_{{.Index}}] = ret_{{inc .Index}}
+	{{end}}
+}
+`
+
+const array = `
+value_{{.Index}}, ok := {{if .IsTop}}data{{else}}raw_value_{{sub .Index}}{{end}}.([]interface{})
+if !ok {
+	return fmt.Errorf("...")
+}
+
+ret_{{.Index}} := make({{.Type}}, 0, len(value_{{.Index}}))
+for _, raw_value_{{.Index}} := range value_{{.Index}} {
+	{{if .Next.IsBuiltin}}
+		element, ok := raw_value_{{.Index}}.({{.Next.Type}})
+		if !ok {
+			return fmt.Errorf("...")
+		}
+	{{else if .Next.IsArray}}
+		{{with .Next}}{{template "TARR" .}}{{end}}
+	{{else if .Next.IsMap}}
+		{{with .Next}}{{template "TMAP" .}}{{end}}
+	{{else if .Next.IsStruct}}
+		{{with .Next}}{{template "TSTRUCT" .}}{{end}}
+	{{end}}
+
+	ret_{{.Index}} = append(ret_{{.Index}}, {{if .Next.IsBuiltin}}element{{else}}ret_{{inc .Index}}{{end}})
+}
+`
+
+const builtin = `
+ret_0, ok := data.({{.Type}})
+if !ok {
+	return fmt.Errorf("...")
+}
+`
+
+const _struct = `
+	value_{{.Index}}, ok := {{if .IsTop}}data{{else}}raw_value_{{sub .Index}}{{end}}.(map[interface{}]interface{})
+	if !ok {
+		return fmt.Errorf("data")
 	}
 
-	_, ok = t.(*ast.InterfaceType)
-	if ok {
-		return "interface", "interface{}"
+	ret_{{.Index}} := {{.Type}}{}
+	{{range $val := .Fields}}
+		{{$val.Name}}_value, ok := value_{{sub .Index}}["{{$val.Alias}}"].({{$val.Type}})
+		if !ok {
+			return fmt.Errorf("{{$val.Name}}")
+		}
+
+		ret_{{sub .Index}}.{{$val.Name}} = {{$val.Name}}_value
+	{{end}}
+`
+
+const main = `
+{{if .IsMap}}
+	{{template "TMAP" .}}
+{{else if .IsArray}}
+	{{template "TARR" .}}
+{{else if .IsBuiltin}}
+	{{template "TBUILTIN" .}}
+{{else if .IsStruct}}
+	{{template "TSTRUCT" .}}
+{{else}}
+	panic("wrong type")
+{{end}}
+`
+
+// Genrate genrates a function body based on input query.
+// It's naive implementation. It's assumed that the parser.Object is valid and fully complies with the specification.
+func Generate(q query.Query) (string, error) {
+	tmpl := template.Must(template.New("TMAP").Funcs(funcMap).Parse(_map))
+	tmpl = template.Must(tmpl.New("TARR").Parse(array))
+	tmpl = template.Must(tmpl.New("TBUILTIN").Parse(builtin))
+	tmpl = template.Must(tmpl.New("TSTRUCT").Parse(_struct))
+	tmpl = template.Must(tmpl.New("T").Parse(main))
+
+	ret := bytes.NewBuffer(nil)
+
+	err := tmpl.Execute(ret, q)
+	if err != nil {
+		return "", err
 	}
 
-	arr, ok := t.(*ast.ArrayType)
-	if ok {
-		return "array", arr.Elt.(*ast.Ident).Name
-	}
-
-	return "", ""
+	return ret.String(), nil
 }
